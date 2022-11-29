@@ -175,6 +175,8 @@ impl From<&str> for Value {
 }
 
 /// A row of values
+///
+/// Row 被抽象为 Value 组合
 pub type Row = Vec<Value>;
 
 /// A row iterator

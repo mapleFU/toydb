@@ -135,6 +135,8 @@ impl Display for Table {
 }
 
 /// A table column schema
+///
+/// 定义为 meta 中的 column.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Column {
     /// Column name
@@ -215,6 +217,8 @@ impl Column {
     }
 
     /// Validates a column value
+    ///
+    /// Column 对输入每列的值做检查的时候使用. self 是 table schema, value 是写入数据, pk 是数据对应的 row.
     pub fn validate_value(
         &self,
         table: &Table,
@@ -226,6 +230,7 @@ impl Column {
         match value.datatype() {
             None if self.nullable => Ok(()),
             None => Err(Error::Value(format!("NULL value not allowed for column {}", self.name))),
+            // 这个地方没有 cast, 直接做检查.
             Some(ref datatype) if datatype != &self.datatype => Err(Error::Value(format!(
                 "Invalid datatype {} for {} column {}",
                 datatype, self.datatype, self.name
@@ -242,11 +247,16 @@ impl Column {
         }?;
 
         // Validate outgoing references
+        // 寻找 foreign key.
         if let Some(target) = &self.references {
+            // 看看 value 是什么类型, 做一些 dyn 分发.
             match value {
+                // NULL 的话, 啥都不干
                 Value::Null => Ok(()),
                 Value::Float(f) if f.is_nan() => Ok(()),
+                // TODO(maple): 这个地方没搞懂, target == &table.name 是什么意思, self-ref?
                 v if target == &table.name && v == pk => Ok(()),
+                // txn 读取 v, 读取 (Column, value). 如果是 none 即错误.
                 v if txn.read(target, v)?.is_none() => Err(Error::Value(format!(
                     "Referenced primary key {} in table {} does not exist",
                     v, target,
@@ -256,8 +266,12 @@ impl Column {
         }
 
         // Validate uniqueness constraints
+        //
+        // 检查非 unique 的内容
         if self.unique && !self.primary_key && value != &Value::Null {
             let index = table.get_column_index(&self.name)?;
+            // 我日, 走了一个 full scan?
+            // TODO(maple): maybe add an expression for value checking.
             let mut scan = txn.scan(&table.name, None)?;
             while let Some(row) = scan.next().transpose()? {
                 if row.get(index).unwrap_or(&Value::Null) == value

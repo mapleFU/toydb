@@ -14,6 +14,8 @@ use serde_derive::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 
 /// A query plan
+///
+/// 包含一个 PlanNode.
 #[derive(Debug)]
 pub struct Plan(pub Node);
 
@@ -64,6 +66,7 @@ pub enum Node {
         table: String,
     },
     Filter {
+        // filter 会提供 source.
         source: Box<Node>,
         predicate: Expression,
     },
@@ -108,13 +111,16 @@ pub enum Node {
     },
     Order {
         source: Box<Node>,
+        /// order 可能有一组
         orders: Vec<(Expression, Direction)>,
     },
     Projection {
         source: Box<Node>,
+        /// expr alias
         expressions: Vec<(Expression, Option<String>)>,
     },
     Scan {
+        // 给定了 (name, alias, filter).
         table: String,
         alias: Option<String>,
         filter: Option<Expression>,
@@ -422,6 +428,8 @@ impl Display for Node {
 }
 
 /// An aggregate operation
+///
+/// Agg 的类型.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Aggregate {
     Average,

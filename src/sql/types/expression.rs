@@ -11,6 +11,7 @@ use std::mem::replace;
 pub enum Expression {
     // Values
     Constant(Value),
+    // fieldRef
     Field(usize, Option<(Option<String>, String)>),
 
     // Logical operations
@@ -41,6 +42,7 @@ pub enum Expression {
 
 impl Expression {
     /// Evaluates an expression to a value, given an environment
+    /// expr(Option<Row>) -> Value
     pub fn evaluate(&self, row: Option<&Row>) -> Result<Value> {
         use Value::*;
         Ok(match self {

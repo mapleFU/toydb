@@ -19,6 +19,8 @@ pub trait Engine: Clone {
     type Transaction: Transaction;
 
     /// Begins a transaction in the given mode
+    ///
+    /// 创建一个 `mode` transaction.
     fn begin(&self, mode: Mode) -> Result<Self::Transaction>;
 
     /// Begins a session for executing individual statements
@@ -58,6 +60,8 @@ pub trait Transaction: Catalog {
 }
 
 /// An SQL session, which handles transaction control and simplified query execution
+///
+/// Session 可以 bind 一个 Transaction
 pub struct Session<E: Engine> {
     /// The underlying engine
     engine: E,
@@ -67,14 +71,19 @@ pub struct Session<E: Engine> {
 
 impl<E: Engine + 'static> Session<E> {
     /// Executes a query, managing transaction status for the session
+    ///
+    /// 上下文
     pub fn execute(&mut self, query: &str) -> Result<ResultSet> {
         // FIXME We should match on self.txn as well, but get this error:
         // error[E0009]: cannot bind by-move and by-ref in the same pattern
         // ...which seems like an arbitrary compiler limitation
         match Parser::new(query).parse()? {
+            // 下列内容都在处理 BEGIN.
+            // Session 会绑定一个 txn, 读会指定 version
             ast::Statement::Begin { .. } if self.txn.is_some() => {
                 Err(Error::Value("Already in a transaction".into()))
             }
+            // 生成一个新的 txn, txn 会标注 SQL 的 mode, 判断是否是 readonly 的.
             ast::Statement::Begin { readonly: true, version: None } => {
                 let txn = self.engine.begin(Mode::ReadOnly)?;
                 let result = ResultSet::Begin { id: txn.id(), mode: txn.mode() };
@@ -100,10 +109,13 @@ impl<E: Engine + 'static> Session<E> {
                 Err(Error::Value("Not in a transaction".into()))
             }
             ast::Statement::Commit => {
+                // 尝试去 commit.
                 let txn = self.txn.take().unwrap();
                 let id = txn.id();
                 if let Err(err) = txn.commit() {
                     // If the commit fails, we try to recover the transaction.
+                    //
+                    // TODO(maple): 这个地方为啥要 resume 然后重制?
                     if let Ok(t) = self.engine.resume(id) {
                         self.txn = Some(t);
                     }
@@ -130,6 +142,7 @@ impl<E: Engine + 'static> Session<E> {
                 .optimize(self.txn.as_mut().unwrap())?
                 .execute(self.txn.as_mut().unwrap()),
             statement @ ast::Statement::Select { .. } => {
+                // 单个 statement 创建一个事务去执行, Select 会尝试开启一个 Read-Only 事务
                 let mut txn = self.engine.begin(Mode::ReadOnly)?;
                 let result =
                     Plan::build(statement, &mut txn)?.optimize(&mut txn)?.execute(&mut txn);
@@ -137,6 +150,7 @@ impl<E: Engine + 'static> Session<E> {
                 result
             }
             statement => {
+                // 单个 statement 创建一个事务去执行, 非 Select, 尝试开启一个 read-write 事务
                 let mut txn = self.engine.begin(Mode::ReadWrite)?;
                 match Plan::build(statement, &mut txn)?.optimize(&mut txn)?.execute(&mut txn) {
                     Ok(result) => {

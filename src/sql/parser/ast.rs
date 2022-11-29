@@ -38,6 +38,8 @@ pub enum Statement {
     },
 
     Select {
+        /// Select expr as alias, 后面是个 Optional 的 alias...
+        /// 讲道理, 我就是不太喜欢这种用 Tuple 而不是 fieldName 的...
         select: Vec<(Expression, Option<String>)>,
         from: Vec<FromItem>,
         r#where: Option<Expression>,
@@ -56,10 +58,12 @@ pub enum FromItem {
         name: String,
         alias: Option<String>,
     },
+    // JoinType 考虑数种, 递归进行定义.
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
         r#type: JoinType,
+        // Predict 产生对应的逻辑
         predicate: Option<Expression>,
     },
 }
@@ -96,10 +100,16 @@ pub enum Order {
 /// Expressions
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expression {
+    /// TableName, Name(alias or field-name)
     Field(Option<String>, String),
+    /// 内部实现, 对某个 Column 的引用.
     Column(usize), // only used during plan building to break off expression subtrees
+    /// bool 之类的 literal, 这个地方感觉没有进行类型推断和类型提升
+    /// 目测是解析出是什么类型就当成什么类型处理了.
     Literal(Literal),
+    /// AVG(expr1, expr2...)
     Function(String, Vec<Expression>),
+    /// 非 fnCall 形式的操作, 这里会把 LIKE 之类的都归为 Operation 了.
     Operation(Operation),
 }
 
@@ -174,6 +184,12 @@ impl Expression {
     }
 
     /// Transforms the expression tree by applying a closure before and after descending.
+    ///
+    /// 这个其实有点 visit tree 的感觉, 这个代码其实是有点蛋疼的. 遍历方式大概是:
+    /// * before(self)
+    /// * transmute 所有子节点, 对于 Literal, Field, Column 不做任何检查. 这里递归对 Operation / Function 使用
+    ///   transmute. (这些感觉都是动态的，感觉 Visitor 模式代码写的爽些?)
+    /// * after(self)
     pub fn transform<B, A>(mut self, before: &mut B, after: &mut A) -> Result<Self>
     where
         B: FnMut(Self) -> Result<Self>,
@@ -230,6 +246,8 @@ impl Expression {
     }
 
     /// Walks the expression tree, calling a closure for every node. Halts if closure returns false.
+    ///
+    /// walk 则是 visitor 的另一种形式了.
     pub fn walk<F: Fn(&Expression) -> bool>(&self, visitor: &F) -> bool {
         use Operation::*;
         visitor(self)
