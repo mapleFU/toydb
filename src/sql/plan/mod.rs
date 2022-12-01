@@ -1,7 +1,7 @@
 mod optimizer;
 mod planner;
 use optimizer::Optimizer as _;
-use planner::Planner;
+pub use planner::Planner;
 
 use super::engine::Transaction;
 use super::execution::{Executor, ResultSet};

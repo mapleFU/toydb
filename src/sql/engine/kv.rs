@@ -68,7 +68,7 @@ pub struct Transaction {
 
 impl Transaction {
     /// Creates a new SQL transaction from an MVCC transaction
-    fn new(txn: kv::mvcc::Transaction) -> Self {
+    pub fn new(txn: kv::mvcc::Transaction) -> Self {
         Self { txn }
     }
 

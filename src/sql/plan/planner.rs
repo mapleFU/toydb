@@ -4,6 +4,7 @@ use super::super::types::{Expression, Value};
 use super::{Aggregate, Direction, Node, Plan};
 use crate::error::{Error, Result};
 
+use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::mem::replace;
 
@@ -167,9 +168,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
                 let mut hidden = 0;
                 // 如果 select 是 empty, 这里相当于全部输出.
                 if !select.is_empty() {
-                    /**
-                     * 处理 Select 之前, 选择哪些 columns 的问题
-                     */
+                    // 处理 Select 之前, 选择哪些 columns 的问题
 
                     // Inject hidden SELECT columns for fields and aggregates used in ORDER BY and
                     // HAVING expressions but not present in existing SELECT output. These will be
@@ -285,6 +284,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
                     }
                 }
 
+                debug!("node is {}", node);
                 node
             }
         })
@@ -399,7 +399,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
     ) -> Result<Node> {
         let mut aggregates = Vec::new();
         let mut expressions = Vec::new();
-        /**
+        /*
          * 下面两组顺序先后没关系, 但决定了 `expressions` 中的顺序, 先 Selection 中的, 后
          * GROUP BY 中的, 和 column-ref 中的逻辑是对应的.
          */
