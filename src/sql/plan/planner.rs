@@ -4,7 +4,6 @@ use super::super::types::{Expression, Value};
 use super::{Aggregate, Direction, Node, Plan};
 use crate::error::{Error, Result};
 
-use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::mem::replace;
 
@@ -143,7 +142,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
                 // Build FROM clause.
                 //
                 // 先 Build from 子句, 这里成分是 TableRef, 如果有多个相当于这些做 CrossJoin.
-                // (这些是怎么丢给 optimizer 的?)
+                // Note: select 是空代表 select *
                 let mut node = if !from.is_empty() {
                     self.build_from_clause(scope, from)?
                 } else if select.is_empty() {
@@ -166,7 +165,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
                 //
                 // 处理 select.
                 let mut hidden = 0;
-                // 如果 select 是 empty, 这里相当于全部输出.
+                // 如果 select 是 empty, 这里相当于全部输出 (*).
                 if !select.is_empty() {
                     // 处理 Select 之前, 选择哪些 columns 的问题
 
@@ -284,7 +283,6 @@ impl<'a, C: Catalog> Planner<'a, C> {
                     }
                 }
 
-                debug!("node is {}", node);
                 node
             }
         })
@@ -545,7 +543,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
     /// the given expression with Column references to either existing columns or new, hidden
     /// columns in the select expressions. Returns the number of hidden columns added.
     ///
-    /// ORDER BY 和 HAVING 的子表达式为 expr, 把 expr 注入 select.
+    /// ORDER BY 和 HAVING 的子表达式为 expr, 把 expr 注入 select. 注意在这个阶段是 ast 上的插入.
     fn inject_hidden(
         &self,
         expr: &mut ast::Expression,
@@ -559,7 +557,9 @@ impl<'a, C: Catalog> Planner<'a, C> {
                 *expr = ast::Expression::Column(i);
                 continue;
             }
-            // 否则, 去 visit + transmute 树的成员
+            // 否则, 去 visit + transmute 所有 expr 树的成员:
+            // * 如果有 ColumnRef 匹配成功, 这个地方就会 transmute 成为 ColumnRef, 指向前面的 column
+            // * 否则保持
             if let Some(label) = label {
                 expr.transform_mut(
                     &mut |e| match e {
@@ -575,9 +575,13 @@ impl<'a, C: Catalog> Planner<'a, C> {
         // Any remaining aggregate functions and field references must be extracted as hidden
         // columns.
         let mut hidden = 0;
+        // 之前做了去重, 现在要将不能去重的加入 Selection-List 了. 形式是先加入 `select`, 然后把 ast 变换成
+        // `ast::Expression::Column`.
+        //
         // 这个地方相当于递归访问, 直到出现匹配的 ast::Expression::Field, 遇到以后, 会加入 select 列表,
         // 然后让 Column 指向它.
-        // TODO(maple): 这个地方如果是已经遇到的 Field 会怎么样? eg: SELECT a, SUM(*) GROUP BY (a+2)
+        // Q: 这个地方如果是已经遇到的 Field 会怎么样? eg: SELECT a, SUM(*) GROUP BY (a+2)
+        // A: 会因为 match 不到暴毙哟, 见 `test_basic_sql_group_by_expr`
         expr.transform_mut(
             &mut |e| match &e {
                 ast::Expression::Function(f, a) if self.aggregate_from_name(f).is_some() => {
@@ -626,8 +630,11 @@ impl<'a, C: Catalog> Planner<'a, C> {
 
     /// Builds an expression from an AST expression
     ///
-    /// Build 阶段都是去拿已有的.
-    fn build_expression(&self, scope: &mut Scope, expr: ast::Expression) -> Result<Expression> {
+    /// Build 阶段都是去拿已有的 scope. 这个之前是 `&mut Scope`, 我改成 `&Scope` 卵事没有.
+    /// Expr 本身不会改变数据的 schema, 它只会 visit 自己的树, 然后找到对应信息, 然后访问.
+    ///
+    /// Literal 这个地方会尝试识别类型, 但不会做 type-cast. 都在 Evaluation 的时候做.
+    fn build_expression(&self, scope: &Scope, expr: ast::Expression) -> Result<Expression> {
         use Expression::*;
         Ok(match expr {
             ast::Expression::Literal(l) => Constant(match l {
@@ -756,7 +763,9 @@ pub struct Scope {
     // Currently visible tables, by query name (i.e. alias or actual name).
     //
     // Table 的名称集合, 构建了 alias / table_name -> Table 的映射
-    // TODO(maple): 这个 Table 是怎么构建出来的? 具体 binding 吗?
+    // 如果用 alias 的话, 就用 alias 代替真正的 table name.
+    // 当遇到 From 和表名的时候, 这里会添加一个 table 进来, 同时 Planner 会识别语法里的 as,
+    //  用来覆盖 tableName.
     tables: HashMap<String, Table>,
     // Column labels, if any (qualified by table name when available)
     //
@@ -770,6 +779,7 @@ pub struct Scope {
     unqualified: HashMap<String, usize>,
     // Unqualified ambiguous names.
     // TODO(maple): ambiguous 的 name 是怎么 solving 的?
+    //  看了一圈代码感觉根本没有 solving.
     ambiguous: HashSet<String>,
 }
 
@@ -809,6 +819,8 @@ impl Scope {
                 self.qualified.insert((t, l.clone()), self.columns.len());
             }
             // 否则, push-back 到 unqualified 或者 ambiguous
+            // ambiguous 是多次出现但是都没表名的
+            // 否则丢到 unqualified. (相当于在 unqualified 出现两次就 ambiguous 了).
             if !self.ambiguous.contains(&l) {
                 if !self.unqualified.contains_key(&l) {
                     self.unqualified.insert(l, self.columns.len());
@@ -870,7 +882,6 @@ impl Scope {
             return Err(Error::Internal("Can't modify constant scope".into()));
         }
         // 查看 Table 和自身 Table 有没有冲突
-        // TODO(maple):有冲突会怎么半, 比如 a JOIN b, a JOIN c
         for (label, table) in scope.tables {
             if self.tables.contains_key(&label) {
                 return Err(Error::Value(format!("Duplicate table name {}", label)));
@@ -885,7 +896,13 @@ impl Scope {
 
     /// Resolves a name, optionally qualified by a table name.
     ///
-    /// Resolve 去拿到对应的 name.
+    /// Resolve 去拿到对应的 name, 注意规则:
+    /// * 如果当前是个 constant, 就没啥 resolve 的, 不需要根据 name 来查找.
+    /// * 如果带 table 名称来访问, 那么其实很好做 solving, 已有的 table 会添加所有的 columns,
+    ///   然后映射到 `scope.columns` 里面, 很容易直接找到对应的列.
+    /// * 在 unqualified 字段中查找对应的名字.
+    ///
+    /// 每个名字可以映射到一个返回值的列上, 用这种方式来表达列的处理.
     fn resolve(&self, table: Option<&str>, name: &str) -> Result<usize> {
         if self.constant {
             return Err(Error::Value(format!(
@@ -907,7 +924,8 @@ impl Scope {
         } else {
             // 在 unqualified 里面找 name.
             // (虚拟生成的字段是否是 unqualified?)
-            // 一点想法: 感觉 put 的时候用 Option 本身不是一个好主意, 我现在都分不清什么时候会 put unqualifed 了.
+            // 一点想法: 感觉 put 的时候, 函数声明上用 Option 本身不是一个好主意,
+            //  因为我现在都分不清什么时候会 put unqualified 了.
             self.unqualified
                 .get(name)
                 .copied()

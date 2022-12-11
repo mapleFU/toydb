@@ -309,12 +309,23 @@ impl Catalog for Transaction {
 /// be None to get a keyspace prefix. We use table and column names directly as identifiers, to
 /// avoid additional indirection and associated overhead. It is not possible to change names, so
 /// this is ok. Uses Cows since we want to borrow when encoding but return owned when decoding.
+///
+/// 最后一项可能由 Option 构成, Option 为空的时候, 可以拿到这个 key
+/// 编码: 这里会把对应的对象整理成一个 Key, Table / Index / Row 存放在不同的 keyspace (类似 ns).
+///
+/// 这个基本上套了一层 foundation db 的编码系统。
 enum Key<'a> {
     /// A table schema key for the given table name
+    /// tableName.
+    /// 这个的 prefix 为 0x01
     Table(Option<Cow<'a, str>>),
     /// A key for an index entry
+    ///
+    /// (tableName, columnName, value).
     Index(Cow<'a, str>, Cow<'a, str>, Option<Cow<'a, Value>>),
     /// A key for a row identified by table name and row primary key
+    ///
+    /// (tableName, value)
     Row(Cow<'a, str>, Option<Cow<'a, Value>>),
 }
 

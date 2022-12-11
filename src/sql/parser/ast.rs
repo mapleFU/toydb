@@ -58,12 +58,12 @@ pub enum FromItem {
         name: String,
         alias: Option<String>,
     },
-    // JoinType 考虑数种, 递归进行定义.
+    /// JoinType 考虑数种, 递归进行定义.
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
         r#type: JoinType,
-        // Predict 产生对应的逻辑
+        /// JOIN ... ON expr 的那个 Expr
         predicate: Option<Expression>,
     },
 }

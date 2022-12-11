@@ -476,6 +476,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a select clause
+    ///
+    /// Note: 如果 Select *, 则返回 Select empty.
     fn parse_clause_select(&mut self) -> Result<Vec<(ast::Expression, Option<String>)>> {
         let mut select = Vec::new();
         if self.next_if_token(Keyword::Select.into()).is_none() {
