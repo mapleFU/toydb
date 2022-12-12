@@ -100,7 +100,13 @@ mod test {
         let mut mock_planner = plan::Planner::new(&mut *txn);
         let planner_result = mock_planner.build(statement);
 
+        // Print physical structure
         println!("{:?}", planner_result);
+        let plan = planner_result.unwrap();
+        // Print logical structure
+        println!("{}", plan);
+
+        let _ = plan.execute(txn);
     }
 
     #[test]
@@ -159,6 +165,19 @@ mod test {
         // "SELECT sum(a), b FROM t WHERE a > 0 GROUP BY (b + 2)" will failed
         test_any_sql(
             "SELECT sum(a), b + 2 FROM t WHERE a > 0 GROUP BY (b + 2)",
+            &mut mocked_catalog_engine,
+        );
+    }
+
+    #[test]
+    fn test_basic_sql_group_by_expr2() {
+        let mut mocked_catalog_engine = mock_catalog();
+
+        let table = test_table1();
+        mocked_catalog_engine.create_table(table).unwrap();
+
+        test_any_sql(
+            "SELECT COUNT(*) FROM t WHERE a > 0 GROUP BY b / 100",
             &mut mocked_catalog_engine,
         );
     }

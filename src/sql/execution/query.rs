@@ -61,6 +61,7 @@ impl<T: Transaction> Executor<T> for Projection<T> {
         if let ResultSet::Query { columns, rows } = self.source.execute(txn)? {
             let (expressions, labels): (Vec<Expression>, Vec<Option<String>>) =
                 self.expressions.into_iter().unzip();
+            // 在运行时构建一份 Schema
             let columns = expressions
                 .iter()
                 .enumerate()
@@ -74,6 +75,7 @@ impl<T: Transaction> Executor<T> for Projection<T> {
                     }
                 })
                 .collect();
+            // 对输入的 Row 进行 Eval, 产生 rows.
             let rows = Box::new(rows.map(move |r| {
                 r.and_then(|row| {
                     expressions.iter().map(|e| e.evaluate(Some(&row))).collect::<Result<_>>()

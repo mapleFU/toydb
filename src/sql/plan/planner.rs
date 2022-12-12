@@ -12,6 +12,26 @@ pub struct Planner<'a, C: Catalog> {
     catalog: &'a mut C,
 }
 
+/// Returns the aggregate corresponding to the given aggregate function name.
+fn aggregate_from_name(name: &str) -> Option<Aggregate> {
+    match name {
+        "avg" => Some(Aggregate::Average),
+        "count" => Some(Aggregate::Count),
+        "max" => Some(Aggregate::Max),
+        "min" => Some(Aggregate::Min),
+        "sum" => Some(Aggregate::Sum),
+        _ => None,
+    }
+}
+
+/// Checks whether a given expression is an aggregate expression.
+fn is_aggregate(expr: &ast::Expression) -> bool {
+    expr.contains(&|e| match e {
+        ast::Expression::Function(f, _) => aggregate_from_name(f).is_some(),
+        _ => false,
+    })
+}
+
 impl<'a, C: Catalog> Planner<'a, C> {
     /// Creates a new planner.
     pub fn new(catalog: &'a mut C) -> Self {
@@ -205,7 +225,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
                     // 这里先抽出 agg, 即 HAVING, ORDERING 和 SELECT 出的字段, 把 Agg(expr) 等转化为 expr on columnRef,
                     // 函数抽在 aggregates 中.
                     let aggregates = self.extract_aggregates(&mut select)?;
-                    // 抽出 Group By 的 Columns.
+                    // 抽出 Group By 的 Columns (在有的优化器中, aggregates 作为这部分的上下文).
                     let groups = self.extract_groups(&mut select, group_by, aggregates.len())?;
                     // 构建 Agg PlanNode, 这部分会抽掉 groups 和 aggregates
                     if !aggregates.is_empty() || !groups.is_empty() {
@@ -213,6 +233,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
                     }
 
                     // Build the remaining non-aggregate projection.
+                    // 最终去 Build 整个 Selection-List
                     // 再嵌套一层 Projection, 这里会从 Group By 和 Agg 中抽出 naming.
                     let expressions: Vec<(Expression, Option<String>)> = select
                         .into_iter()
@@ -365,7 +386,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
                     ast::JoinType::Cross | ast::JoinType::Inner => false,
                     ast::JoinType::Left | ast::JoinType::Right => true,
                 };
-                // TODO(maple): 这个地方为什么可以不带 JoinKey 呢?
+                // JoinKey 的身份由 Predict 来承担.
                 let mut node = Node::NestedLoopJoin { left, left_size, right, predicate, outer };
                 // 如果是 right-join, 插入一个 Project Operator.
                 if matches!(r#type, ast::JoinType::Right) {
@@ -388,6 +409,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
     /// aggregates for the given groups, passing the group values through directly.
     ///
     /// source: 下层的 node, 返回的结构参照 Scope.
+    /// `build_aggregation` 会返回一层 Aggregation + Projection 的节点层.
     fn build_aggregation(
         &self,
         scope: &mut Scope,
@@ -410,6 +432,9 @@ impl<'a, C: Catalog> Planner<'a, C> {
         for (expr, label) in groups {
             expressions.push((self.build_expression(scope, expr)?, label));
         }
+        // 从 scope.project.
+        // 这个地方逻辑需要非常非常注意, 因为 Project 了之后, Schema 整个变掉了, 相当于只有这些列, 和从
+        // table 中取列了。
         scope.project(
             &expressions
                 .iter()
@@ -419,6 +444,10 @@ impl<'a, C: Catalog> Planner<'a, C> {
                     if i < aggregates.len() {
                         // We pass null values here since we don't want field references to hit
                         // the fields in scope before the aggregation.
+                        //
+                        // TODO(maple): 这个地方感觉是不希望 SUM(fieldName) 里面 fieldName, 这里感觉是假装
+                        //  agg 里面比较简单, 然后不希望破坏内容? 没太看懂. 盲猜是假设 Agg 的表达式都很简单, 可以
+                        //  直接 fetch tableRef 或者是 alias.
                         (Expression::Constant(Value::Null), None)
                     } else {
                         (e, l)
@@ -438,26 +467,30 @@ impl<'a, C: Catalog> Planner<'a, C> {
     /// function calls, replaces them with ast::Expression::Column(i), maps the aggregate functions
     /// to aggregates, and returns them along with their argument expressions.
     ///
-    /// 这里相当于从 Select 里面抽出 expr. exprs 都是裸的 ast::expr.
+    /// 这里相当于从 Select 里面抽出 expr. `exprs` 都是裸的 ast::expr.
     /// SELECT max(a) ... 抽成
     /// Select ColumnRef() + Aggr Expressions, 然后返回返回 (aggMethod, agg expr), 比如 (MAX, a + 2).
+    ///
+    /// 这个地方需要注意的是, 在语法上, ast::Expression 可能包含 FUNC(expr, ...). 但是 toydb 对 func 没有特殊处理,
+    /// Expression::Function 基本吊都不会生成, 所以这个时候就特殊匹配了几个 aggregator.
     fn extract_aggregates(
         &self,
         exprs: &mut [(ast::Expression, Option<String>)],
     ) -> Result<Vec<(Aggregate, ast::Expression)>> {
         let mut aggregates = Vec::new();
         for (expr, _) in exprs {
-            // 对 expr 中的表达式, 丢进里面的 lambda 来 transform
+            // 对 ast::expr 中的表达式, 丢进里面的 lambda 来 transform
             // 这里会把 functionCall 的 ast 抽出来, 看看是否是 avg/min/max, 然后提出函数
             expr.transform_mut(
                 &mut |mut e| match &mut e {
-                    // 只检查函数成员为 1 的 fn-call
+                    // 只检查函数成员为 1 的 fn-call, 查看函数名称是否是 aggregator
+                    // (按我对后面代码的理解, 成员不是 1 就报错了, 嘻嘻)
                     ast::Expression::Function(f, args) if args.len() == 1 => {
-                        if let Some(aggregate) = self.aggregate_from_name(f) {
+                        if let Some(aggregate) = aggregate_from_name(f) {
                             // 添加对应的 agg 项, 然后 transform
                             aggregates.push((aggregate, args.remove(0)));
-                            // 指向 aggregates 的长度
-                            // 这个地方很诡异, 是 aggregates 的长度, **暗示了这里会把 aggr 前置**
+                            // 再把这个 ast::Expr::Function 改成 ast::Expr::Column, 指向 aggregates 的长度
+                            // 这个地方很诡异, 是 aggregates 的长度, **暗示了这里会把 aggr 前置到这个算子输出的最开头**
                             Ok(ast::Expression::Column(aggregates.len() - 1))
                         } else {
                             Ok(e)
@@ -470,7 +503,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
         }
         // agg 内部不能有 agg.
         for (_, expr) in &aggregates {
-            if self.is_aggregate(expr) {
+            if is_aggregate(expr) {
                 return Err(Error::Value("Aggregate functions can't be nested".into()));
             }
         }
@@ -481,11 +514,18 @@ impl<'a, C: Catalog> Planner<'a, C> {
     /// offset. These can be either an arbitrary expression, a reference to a SELECT column, or the
     /// same expression as a SELECT column. The following are all valid:
     ///
+    /// ```sql
     /// SELECT released / 100 AS century, COUNT(*) FROM movies GROUP BY century
     /// SELECT released / 100, COUNT(*) FROM movies GROUP BY released / 100
     /// SELECT COUNT(*) FROM movies GROUP BY released / 100
+    /// ```
     ///
     /// GroupBy column 替换为 GROUP BY Expr. 返回 (原 expr, alias).
+    /// 这里只会识别出两种 Group-BY:
+    /// * Select column ... GROUP BY column
+    /// * Select column-expr  ... GROUP BY column-expr (比如上面例子的第二个）
+    /// 上面给的 SELECT COUNT(*) FROM movies GROUP BY released / 100 会怎么处理呢？
+    /// 这里会直接搞个 (released / 100) 的表达式, 然后没有任何转换.
     fn extract_groups(
         &self,
         // exprs: 输入的表达式列表, min-max 被转成 Column.
@@ -494,14 +534,15 @@ impl<'a, C: Catalog> Planner<'a, C> {
         group_by: Vec<ast::Expression>,
         offset: usize,
     ) -> Result<Vec<(ast::Expression, Option<String>)>> {
-        // (ast::Expr, expr)
+        // (原 expr, alias).
         let mut groups = Vec::with_capacity(exprs.len());
         for g in group_by {
             // Look for references to SELECT columns with AS labels
+            //
             // 如果是 GROUP BY col-name, 这个地方会强制找到 expr 中对应的对象.
             // SELECT a as alias ... GROUP BY a, 把 selection 中的 a 替换为对 group 的 column-ref,
-            // 然后 group 表达为 (a, alias-for-a).
-            // TODO(maple): 这个地方感觉匹配不到是有问题的吧, 如果是 field-ref
+            // 然后 group 表达为 (idx, alias-for-a) 的 ast::Column 形式.
+            // 这里匹配的是 GROUP BY col-name, 和 expr 中完全相等的情景, 算是个 fast-path?
             if let ast::Expression::Field(None, label) = &g {
                 if let Some(i) = exprs.iter().position(|(_, l)| l.as_deref() == Some(label)) {
                     groups.push((
@@ -530,7 +571,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
         // Make sure no group expressions contain Column references, which would be placed here
         // during extract_aggregates().
         for (expr, _) in &groups {
-            if self.is_aggregate(expr) {
+            if is_aggregate(expr) {
                 return Err(Error::Value("Group expression cannot contain aggregates".into()));
             }
         }
@@ -584,9 +625,9 @@ impl<'a, C: Catalog> Planner<'a, C> {
         // A: 会因为 match 不到暴毙哟, 见 `test_basic_sql_group_by_expr`
         expr.transform_mut(
             &mut |e| match &e {
-                ast::Expression::Function(f, a) if self.aggregate_from_name(f).is_some() => {
+                ast::Expression::Function(f, a) if aggregate_from_name(f).is_some() => {
                     if let ast::Expression::Column(c) = a[0] {
-                        if self.is_aggregate(&select[c].0) {
+                        if is_aggregate(&select[c].0) {
                             return Err(Error::Value(
                                 "Aggregate function cannot reference aggregate".into(),
                             ));
@@ -606,26 +647,6 @@ impl<'a, C: Catalog> Planner<'a, C> {
             &mut |e| Ok(e),
         )?;
         Ok(hidden)
-    }
-
-    /// Returns the aggregate corresponding to the given aggregate function name.
-    fn aggregate_from_name(&self, name: &str) -> Option<Aggregate> {
-        match name {
-            "avg" => Some(Aggregate::Average),
-            "count" => Some(Aggregate::Count),
-            "max" => Some(Aggregate::Max),
-            "min" => Some(Aggregate::Min),
-            "sum" => Some(Aggregate::Sum),
-            _ => None,
-        }
-    }
-
-    /// Checks whether a given expression is an aggregate expression.
-    fn is_aggregate(&self, expr: &ast::Expression) -> bool {
-        expr.contains(&|e| match e {
-            ast::Expression::Function(f, _) => self.aggregate_from_name(f).is_some(),
-            _ => false,
-        })
     }
 
     /// Builds an expression from an AST expression
@@ -941,26 +962,38 @@ impl Scope {
     /// Projects the scope. This takes a set of expressions and labels in the current scope,
     /// and returns a new scope for the projection.
     ///
-    /// Project 会产生一个新的 expr, 但是会调换顺序.
+    /// Project 被用于 Projection 表达式,
+    /// Project 会接受用户传递的 expr, 同时会根据 expr 调换自身 `Scope` 顺序, 这个被用在构建 Project 算子上.
+    /// 比如:
+    /// ···
+    /// Project [exprs]
+    /// -> Src (`self` 即 `Scope`)
+    /// ···
+    /// 这里会在新的 `Scope` 上, 生成新的 Scope, 之后 underlying 的东西只有走 table 才能拿到
     fn project(&mut self, projection: &[(Expression, Option<String>)]) -> Result<()> {
         if self.constant {
             return Err(Error::Internal("Can't modify constant scope".into()));
         }
         let mut new = Self::new();
+        // 拿到所有需要访问的表
         new.tables = self.tables.clone();
         for (expr, label) in projection {
             match (expr, label) {
-                // 添加了一个没有 table name 的名称.
+                // 假设 label 有名字, 添加了一个没有 table name 的名称
                 (_, Some(label)) => new.add_column(None, Some(label.clone())),
+                // 对于下面 case, label 都是 None
+                // 如果是 table.field 访问, 那么 new.tables 可以直接找到, 插入对应 Column
                 (Expression::Field(_, Some((Some(table), name))), _) => {
                     new.add_column(Some(table.clone()), Some(name.clone()))
                 }
+                // 如果是 field, 那么从 unqualified 找, 加入对应 column.
                 (Expression::Field(_, Some((None, name))), _) => {
                     if let Some(i) = self.unqualified.get(name) {
                         let (table, name) = self.columns[*i].clone();
                         new.add_column(table, name);
                     }
                 }
+                // 直接从来源的地方找对应的表达式.
                 (Expression::Field(i, None), _) => {
                     let (table, label) = self.columns.get(*i).cloned().unwrap_or((None, None));
                     new.add_column(table, label)
