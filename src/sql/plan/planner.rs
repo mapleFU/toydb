@@ -4,6 +4,7 @@ use super::super::types::{Expression, Value};
 use super::{Aggregate, Direction, Node, Plan};
 use crate::error::{Error, Result};
 
+use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::mem::replace;
 
@@ -520,6 +521,11 @@ impl<'a, C: Catalog> Planner<'a, C> {
     /// SELECT COUNT(*) FROM movies GROUP BY released / 100
     /// ```
     ///
+    /// 这里应该支持:
+    /// ```sql
+    /// SELECT v3, MAX(v1) + MAX(v2) from table where <cond> group by v3 having count(v4) > count(v5);
+    /// ```
+    ///
     /// GroupBy column 替换为 GROUP BY Expr. 返回 (原 expr, alias).
     /// 这里只会识别出两种 Group-BY:
     /// * Select column ... GROUP BY column
@@ -585,11 +591,19 @@ impl<'a, C: Catalog> Planner<'a, C> {
     /// columns in the select expressions. Returns the number of hidden columns added.
     ///
     /// ORDER BY 和 HAVING 的子表达式为 expr, 把 expr 注入 select. 注意在这个阶段是 ast 上的插入.
+    ///
+    /// 这个地方有一个比较 hacking 的地方:
+    ///
+    /// 对于: `test_basic_sql_group_by_expr3` 这样的 SQL, COUNT(a) > COUNT(b) 这个中, 如果有比较的话, 那么找不到对应的
+    /// 代换, 只会把 COUNT(a) 代换成 COUNT(column-ref).
+    ///
+    /// 我在这加入了一行修改, 让他能够输出正确的逻辑.
     fn inject_hidden(
         &self,
         expr: &mut ast::Expression,
         select: &mut Vec<(ast::Expression, Option<String>)>,
     ) -> Result<usize> {
+        // println!("SelectionList: {:?}, expr: {:?}", select, expr);
         // Replace any identical expressions or label references with column references.
         for (i, (sexpr, label)) in select.iter().enumerate() {
             // 如果是 select 里面的成员. (eg. select a + 2 ... GROUP BY a + 2 ORDER BY a + 2, 已经存在于 list 中)
@@ -598,9 +612,24 @@ impl<'a, C: Catalog> Planner<'a, C> {
                 *expr = ast::Expression::Column(i);
                 continue;
             }
+
+            // 这段是我加的, 因为我很好奇, 为什么不加.
+            expr.transform_mut(
+                &mut |e| {
+                    if &e == sexpr {
+                        Ok(ast::Expression::Column(i))
+                    } else {
+                        Ok(e)
+                    }
+                },
+                &mut |e| Ok(e),
+            )?;
+
             // 否则, 去 visit + transmute 所有 expr 树的成员:
             // * 如果有 ColumnRef 匹配成功, 这个地方就会 transmute 成为 ColumnRef, 指向前面的 column
             // * 否则保持
+            //
+            // 这个 label 基本采取 alias 的机制.
             if let Some(label) = label {
                 expr.transform_mut(
                     &mut |e| match e {

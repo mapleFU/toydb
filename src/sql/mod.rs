@@ -183,6 +183,19 @@ mod test {
     }
 
     #[test]
+    fn test_basic_sql_group_by_expr3() {
+        let mut mocked_catalog_engine = mock_catalog();
+
+        let table = test_table1();
+        mocked_catalog_engine.create_table(table).unwrap();
+
+        test_any_sql(
+            "SELECT b as t_b, COUNT(a) FROM t WHERE a > 0 GROUP BY t_b HAVING COUNT(a) > COUNT(c)",
+            &mut mocked_catalog_engine,
+        );
+    }
+
+    #[test]
     fn test_basic_sql_join() {
         let mut mocked_catalog_engine = mock_catalog();
 
